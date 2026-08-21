@@ -40,20 +40,20 @@ From: optix-base.sif
     # Relax errexit/nounset around CVMFS scripts (they touch unset vars and
     # can return non-zero benignly); explicit gates below catch real failures.
     set +eu
-    source /cvmfs/dune.opensciencegrid.org/spack/setup-env.sh
+    source /cvmfs/dune.opensciencegrid.org/spack/v1.2.2/share/spack/setup-env.sh
     spack env activate dune-prototype          # <-- must provide geant4@11.2.2
     spack load gcc@12.5.0 arch=linux-almalinux9-x86_64_v3
     spack load geant4@11.2.2 clhep@2.4.7.1 xerces-c@3.3.0
     set -eu
 
-    # Re-assert container CUDA 13 over Spack's CUDA (12.6.3) — this MUST win.
+    # Re-assert container CUDA 13 over Spacks CUDA (12.6.3) — this MUST win.
     export PATH=/usr/local/cuda/bin:$PATH
     export CC=$(which gcc)
     export CXX=$(which g++)
     export CUDA_HOME=/usr/local/cuda
     export CUDACXX=/usr/local/cuda/bin/nvcc
 
-    # Hard gate: fail the build loudly if the toolchain isn't what we expect.
+    # Hard gate: fail the build loudly if the toolchain isnt what we expect.
     nvcc --version | grep -q "release 13" || { echo "FATAL: nvcc is not CUDA 13"; exit 1; }
 
     # ----- Phase 4: derive prefixes (never hand-type CVMFS hashes) + exports -----
@@ -75,8 +75,8 @@ From: optix-base.sif
     export OPTICKS_COMPUTE_CAPABILITY=75                 # <-- SET TO DEPLOYMENT GPU: 86=Ampere, 89=Ada
     export PYTHONPATH=/opt
     export CUDAHOSTCXX=$(which g++)
-    export CMAKE_PREFIX_PATH=$G4_PREFIX:$CLHEP_PREFIX:$XP:$CMAKE_PREFIX_PATH
-
+    export CMAKE_PREFIX_PATH=/usr/local/cuda/:$G4_PREFIX:$CLHEP_PREFIX:$XP
+    export CUDAToolkit_ROOT=/usr/local/cuda
     # ----- Phase 5: build (GPU-prep auto-skips; no GPU at build time) -----
     bash -c '    
       source /opt/opticks/opticks.bash
