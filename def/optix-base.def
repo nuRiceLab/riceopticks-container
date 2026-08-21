@@ -1,0 +1,35 @@
+Bootstrap: docker
+From: nvidia/cuda:13.0.1-devel-rockylinux9    # verify exact tag on NGC / hub.docker.com
+
+%files
+    vendor/NVIDIA-OptiX-SDK-9.0.0-linux64-x86_64.sh /opt/optix-installer.sh
+
+%post
+    set -eux
+    mkdir -p /cvmfs
+    test -f /opt/optix-installer.sh
+    dnf -y install gcc gcc-c++ make cmake git which findutils
+
+    mkdir -p /opt/optix
+    sh /opt/optix-installer.sh --skip-license --prefix=/opt/optix --include-subdir
+    rm -f /opt/optix-installer.sh
+    OPTIX_DIR=$(find /opt/optix -maxdepth 1 -type d -name "NVIDIA-OptiX-SDK-9.0.0*" | head -n1)
+    ln -sfn "$OPTIX_DIR" /opt/optix/current
+
+    grep "define OPTIX_VERSION" /opt/optix/current/include/optix.h
+    printf '#include <optix.h>\n#include <optix_stubs.h>\nint main(){return 0;}\n' > /opt/t.c
+    gcc -I/opt/optix/current/include -I/usr/local/cuda/include -c /opt/t.c -o /opt/t.o
+    rm -f /opt/t.c /opt/t.o
+    echo "OptiX 9.0.0 headers verified against CUDA 13 toolkit."
+
+%environment
+    export OptiX_INSTALL_DIR=/opt/optix/current
+    export OPTICKS_OPTIX_PREFIX=/opt/optix/current
+    export CPATH=/opt/optix/current/include:${CPATH:-}
+    export OPTICKS_COMPUTE_CAPABILITY=75
+
+%labels
+    OptiX_Version 9.0.0
+    CUDA 13.0
+    Driver_Floor R580
+    GPU_Arch_Floor Turing_sm75

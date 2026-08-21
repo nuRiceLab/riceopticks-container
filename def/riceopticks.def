@@ -1,0 +1,145 @@
+Bootstrap: localimage
+From: optix-base.sif
+
+# =============================================================================
+# RiceOpticks layer  (nuRiceLab/RiceOpticks v1.0r)
+#
+# Builds on optix-base.sif (CUDA 13.0 toolkit + OptiX 9.0.0 headers).
+# Physics externals (gcc 12.5.0, Geant4 11.2.2, CLHEP, Xerces-C) come from
+# the DUNE Spack stack on CVMFS, so:
+#
+#   BUILD:  requires /cvmfs mounted -> build with --bind /cvmfs (see notes)
+#   RUNTIME: requires /cvmfs mounted AND an R580+ driver via --nv
+#
+# This image is therefore NOT self-contained: it is pinned to the exact
+# Spack environment revision it was built against.
+# =============================================================================
+
+%post -c /bin/bash
+    set -eux
+
+    # ----- Phase 1: system deps FIRST (dnf segfaults under a loaded Spack) -----
+    # 'curl' omitted on purpose: base image ships curl-minimal which conflicts.
+    # 'xerces-c-devel' omitted on purpose: Xerces comes from Spack, not the OS.
+    dnf -y install \
+        boost-devel expat-devel zlib-devel openssl-devel libuuid-devel \
+        libX11-devel libXrandr-devel libXinerama-devel libXcursor-devel \
+        libXi-devel mesa-libGL-devel mesa-libGLU-devel \
+        python3 which findutils git
+    dnf clean all
+
+    # ----- Phase 2: clone RiceOpticks (dir MUST be named 'opticks') -----
+    # The repo has an __init__.py; `import opticks` needs a dir literally
+    # called 'opticks' on PYTHONPATH.
+    git clone https://github.com/nuRiceLab/RiceOpticks /opt/opticks
+    git -C /opt/opticks checkout v1.0r        # commit 754d992
+
+    mkdir -p /cvmfs                            # runtime bind mountpoint
+
+    # ----- Phase 3: Spack env + v3 compiler + physics externals -----
+    # Relax errexit/nounset around CVMFS scripts (they touch unset vars and
+    # can return non-zero benignly); explicit gates below catch real failures.
+    set +eu
+    source /cvmfs/dune.opensciencegrid.org/spack/setup-env.sh
+    spack env activate dune-prototype          # <-- must provide geant4@11.2.2
+    spack load gcc@12.5.0 arch=linux-almalinux9-x86_64_v3
+    spack load geant4@11.2.2 clhep@2.4.7.1 xerces-c@3.3.0
+    set -eu
+
+    # Re-assert container CUDA 13 over Spack's CUDA (12.6.3) — this MUST win.
+    export PATH=/usr/local/cuda/bin:$PATH
+    export CC=$(which gcc)
+    export CXX=$(which g++)
+    export CUDA_HOME=/usr/local/cuda
+    export CUDACXX=/usr/local/cuda/bin/nvcc
+
+    # Hard gate: fail the build loudly if the toolchain isn't what we expect.
+    nvcc --version | grep -q "release 13" || { echo "FATAL: nvcc is not CUDA 13"; exit 1; }
+
+    # ----- Phase 4: derive prefixes (never hand-type CVMFS hashes) + exports -----
+    export G4_PREFIX=$(spack location -i geant4@11.2.2)
+    export CLHEP_PREFIX=$(spack location -i clhep@2.4.7.1)
+    export XP=$(spack location -i xerces-c@3.3.0)
+    test -n "$G4_PREFIX" || { echo "FATAL: geant4@11.2.2 not found in env"; exit 1; }
+
+    export Geant4_DIR=$(dirname "$(find "$G4_PREFIX" -name Geant4Config.cmake | head -1)")
+    export OPTICKS_GEANT4_PREFIX=$G4_PREFIX
+    export XERCESC_INCLUDE_DIR=$XP/include
+    export XERCESC_LIBRARY=$(ls $XP/lib/libxerces-c*.so | head -1)
+    test -f "$Geant4_DIR/Geant4Config.cmake" || { echo "FATAL: Geant4Config.cmake missing"; exit 1; }
+
+    export OPTICKS_HOME=/opt/opticks
+    export OPTICKS_PREFIX=/usr/local/opticks
+    export OPTICKS_CUDA_PREFIX=/usr/local/cuda           # container CUDA 13, NOT spacks
+    export OPTICKS_OPTIX_PREFIX=/opt/optix/current
+    export OPTICKS_COMPUTE_CAPABILITY=75                 # <-- SET TO DEPLOYMENT GPU: 86=Ampere, 89=Ada
+    export PYTHONPATH=/opt
+    export CUDAHOSTCXX=$(which g++)
+    export CMAKE_PREFIX_PATH=$G4_PREFIX:$CLHEP_PREFIX:$XP:$CMAKE_PREFIX_PATH
+
+    # ----- Phase 5: build (GPU-prep auto-skips; no GPU at build time) -----
+    bash -c '    
+      source /opt/opticks/opticks.bash
+      opticks-env
+      opticks-info
+      opticks-full
+    '
+    # ----- Write the runtime "source and go" entrypoint -----
+    # Quoted 'EOS' => contents are literal (no expansion at build time).
+    cat > /opt/setup.sh <<'EOS'
+#!/bin/bash
+# RiceOpticks runtime environment. Source this to use Opticks.
+# Needs /cvmfs (dune + larsoft) mounted, and an R580+ driver via --nv.
+source /cvmfs/dune.opensciencegrid.org/spack/setup-env.sh
+spack env activate dune-prototype
+spack load gcc@12.5.0 arch=linux-almalinux9-x86_64_v3
+spack load geant4@11.2.2 clhep@2.4.7.1 xerces-c@3.3.0
+
+# container CUDA 13 must win over spack's CUDA
+export PATH=/usr/local/cuda/bin:$PATH
+
+export OPTICKS_HOME=/opt/opticks
+export OPTICKS_PREFIX=/usr/local/opticks
+export OPTICKS_CUDA_PREFIX=/usr/local/cuda
+export OPTICKS_OPTIX_PREFIX=/opt/optix/current
+export PYTHONPATH=/opt
+
+# Opticks-generated runtime setup (executable + library paths)
+[ -f /usr/local/opticks/bin/opticks-setup.sh ] && source /usr/local/opticks/bin/opticks-setup.sh
+EOS
+    chmod +x /opt/setup.sh
+
+%environment
+    # Kept minimal on purpose: the heavy runtime setup (Spack loads for the
+    # gcc-12.5 libstdc++ that Opticks was compiled against, plus Geant4/CLHEP/
+    # Xerces libs) lives in /opt/setup.sh. Source that for a working env.
+    export OPTICKS_HOME=/opt/opticks
+    export OPTICKS_PREFIX=/usr/local/opticks
+    export OPTICKS_OPTIX_PREFIX=/opt/optix/current
+    export PYTHONPATH=/opt
+
+%runscript
+    # `apptainer run --nv --bind /cvmfs riceopticks.sif <cmd>` => fully set up
+    source /opt/setup.sh
+    exec "$@"
+
+%labels
+    RiceOpticks_Version v1.0r
+    RiceOpticks_Commit 754d992
+    Geant4 11.2.2_spack_cvmfs
+    CUDA 13.0
+    OptiX 9.0.0
+    Driver_Floor R580
+    GPU_Arch_Floor Turing_sm75
+
+%help
+    RiceOpticks (nuRiceLab v1.0r) built against OptiX 9.0.0 + CUDA 13.0,
+    with Geant4 11.2.2 / CLHEP / Xerces-C from the DUNE Spack stack on CVMFS.
+
+    Requires at runtime:
+      * /cvmfs mounted (dune.opensciencegrid.org + larsoft.opensciencegrid.org)
+      * NVIDIA R580+ driver, Turing (sm_75) or newer GPU, exposed via --nv
+
+    Usage:
+      apptainer run  --nv --bind /cvmfs riceopticks.sif <command>
+      apptainer exec --nv --bind /cvmfs riceopticks.sif bash -lc 'source /opt/setup.sh; <command>'
