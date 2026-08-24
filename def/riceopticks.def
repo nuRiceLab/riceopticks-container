@@ -32,7 +32,7 @@ From: optix-base.sif
     # The repo has an __init__.py; `import opticks` needs a dir literally
     # called 'opticks' on PYTHONPATH.
     git clone https://github.com/nuRiceLab/RiceOpticks /opt/opticks
-    git -C /opt/opticks checkout v1.0r        # commit 754d992
+    git -C /opt/opticks checkout v1.0r_production 
 
     mkdir -p /cvmfs                            # runtime bind mountpoint
 
