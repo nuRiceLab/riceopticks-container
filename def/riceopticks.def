@@ -83,14 +83,17 @@ From: optix-base.sif
       opticks-env
       opticks-info
       opticks-full
+      rm -rf /opt/optix
+      test ! -e /opt/optix && echo "OptiX headers stripped OK" || { echo "FATAL: strip failed"; exit 1; }
     '
     # ----- Write the runtime "source and go" entrypoint -----
     # Quoted 'EOS' => contents are literal (no expansion at build time).
     cat > /opt/setup.sh <<'EOS'
 #!/bin/bash
+
 # RiceOpticks runtime environment. Source this to use Opticks.
 # Needs /cvmfs (dune + larsoft) mounted, and an R580+ driver via --nv.
-source /cvmfs/dune.opensciencegrid.org/spack/setup-env.sh
+source /cvmfs/dune.opensciencegrid.org/spack/v1.2.2/share/spack/setup-env.sh
 spack env activate dune-prototype
 spack load gcc@12.5.0 arch=linux-almalinux9-x86_64_v3
 spack load geant4@11.2.2 clhep@2.4.7.1 xerces-c@3.3.0
