@@ -7,18 +7,27 @@ From: /cvmfs/singularity.opensciencegrid.org/fermilab/fnal-wn-el9:latest
 # Foundation for the RiceOpticks stack:
 #   * Base: Fermilab worker-node EL9 (AlmaLinux 9.8) - same userspace as dunesw
 #   * CUDA 13.0 toolkit installed from NVIDIA's rhel9 repo (-> /usr/local/cuda)
-#   * NVIDIA OptiX 9.0.0 headers installed from an injected SDK
+#   * NVIDIA OptiX 9.0.0 headers from the public NVIDIA/optix-dev repo
 #
 # The GPU DRIVER is NOT included - it comes from the host at run time via --nv.
 # Host requirement to RUN anything built on this: NVIDIA R580+ driver, Turing+ GPU.
 #
-# BUILD REQUIREMENT: the build host needs network access to
-# developer.download.nvidia.com (to fetch the CUDA toolkit during %post).
+# OptiX 7+ is header-only on the host side: FindOpticksOptiX.cmake creates
+# Opticks::OptiX as an INTERFACE IMPORTED target with no libraries at all. The
+# implementation ships in the display driver. So ~700 kB of headers is the
+# entire build-time OptiX dependency, and NVIDIA/optix-dev supplies exactly
+# that - no SDK installer, no vendor/ injection, no manual download. The repo
+# is now buildable from a clean clone by anyone.
+#
+# BUILD REQUIREMENTS: network access to
+#   * developer.download.nvidia.com  (CUDA toolkit)
+#   * github.com                     (OptiX headers)
 # =============================================================================
 
-%files
-    # Injected OptiX SDK installer (downloaded manually; NVIDIA-licensed, not redistributable)
-    vendor/NVIDIA-OptiX-SDK-9.0.0-linux64-x86_64.sh /opt/optix-installer.sh
+%arguments
+    OPTIX_TAG=v9.0.0
+    OPTIX_COMMIT=fff65c2a7c592f1ea5f1661ad7d2381cf965f9bd
+    COMPUTE_CAPABILITY=75
 
 %post
     set -eux
@@ -26,27 +35,33 @@ From: /cvmfs/singularity.opensciencegrid.org/fermilab/fnal-wn-el9:latest
     mkdir -p /cvmfs                     # runtime bind mountpoint for downstream images
 
     # ----- CUDA 13.0 toolkit from NVIDIA's repo -----
-    dnf install -y dnf-plugins-core
+    dnf install -y dnf-plugins-core git
     dnf config-manager --add-repo \
         https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo
     # Pin to the 13-0 series (13.0.3) to match hosts running CUDA 13.0 / libcudart.so.13
     dnf install -y cuda-toolkit-13-0
     dnf clean all
 
-    # cuda-toolkit-13-0 installs to /usr/local/cuda-13.0 and creates a /usr/local/cuda symlink.
-    # Ensure the symlink exists (some layouts require it explicitly):
+    # cuda-toolkit-13-0 installs to /usr/local/cuda-13.0 and creates a /usr/local/cuda
+    # symlink. Ensure it exists (some layouts require it explicitly):
     [ -e /usr/local/cuda ] || ln -s /usr/local/cuda-13.0 /usr/local/cuda
-    /usr/local/cuda/bin/nvcc --version | grep -q "release 13" || { echo "FATAL: CUDA is not 13"; exit 1; }
+    /usr/local/cuda/bin/nvcc --version | grep -q "release 13" \
+        || { echo "FATAL: CUDA is not 13"; exit 1; }
 
-    # ----- OptiX 9.0.0 headers -----
+    # ----- OptiX 9.0.0 headers (NVIDIA public header-only repo) -----
     mkdir -p /opt/optix
-    sh /opt/optix-installer.sh --skip-license --prefix=/opt/optix --include-subdir
-    rm -f /opt/optix-installer.sh
-    OPTIX_DIR=$(find /opt/optix -maxdepth 1 -type d -name "NVIDIA-OptiX-SDK-9.0.0*" | head -n1)
-    ln -sfn "$OPTIX_DIR" /opt/optix/current
+    git clone --depth 1 --branch {{ OPTIX_TAG }} \
+        https://github.com/NVIDIA/optix-dev /opt/optix/NVIDIA-OptiX-SDK-9.0.0
+    git -C /opt/optix/NVIDIA-OptiX-SDK-9.0.0 rev-parse HEAD \
+        | grep -q '{{ OPTIX_COMMIT }}' \
+        || { echo "FATAL: optix-dev HEAD is not the pinned commit"; exit 1; }
+    rm -rf /opt/optix/NVIDIA-OptiX-SDK-9.0.0/.git
+    ln -sfn /opt/optix/NVIDIA-OptiX-SDK-9.0.0 /opt/optix/current
 
     # ----- build-time verification (no GPU needed) -----
-    grep "define OPTIX_VERSION" /opt/optix/current/include/optix.h    # expect 90000
+    # Assert on the value, don't just print the line.
+    grep -q "define OPTIX_VERSION 90000" /opt/optix/current/include/optix.h \
+        || { echo "FATAL: OptiX headers are not 9.0.0"; exit 1; }
     printf '#include <optix.h>\n#include <optix_stubs.h>\nint main(){return 0;}\n' > /opt/t.c
     gcc -I/opt/optix/current/include -I/usr/local/cuda/include -c /opt/t.c -o /opt/t.o
     rm -f /opt/t.c /opt/t.o
@@ -58,15 +73,16 @@ From: /cvmfs/singularity.opensciencegrid.org/fermilab/fnal-wn-el9:latest
     export OPTICKS_OPTIX_PREFIX=/opt/optix/current
     export OPTICKS_CUDA_PREFIX=/usr/local/cuda
     export CPATH=/opt/optix/current/include:${CPATH:-}
-    export OPTICKS_COMPUTE_CAPABILITY=75
+    export OPTICKS_COMPUTE_CAPABILITY={{ COMPUTE_CAPABILITY }}
 
 %labels
     Base fnal-wn-el9_almalinux9.8
     CUDA 13.0.3_toolkit_baked
     OptiX 9.0.0
+    OptiX_Source NVIDIA/optix-dev@{{ OPTIX_TAG }}
     Driver_Floor R580
-    GPU_Arch_Floor Turing_sm75
+    GPU_Arch_Floor Turing_sm{{ COMPUTE_CAPABILITY }}
 
 %help
-    OptiX 9.0.0 + CUDA 13.0 toolkit on the Fermilab EL9 worker-node base.
-    Driver comes from the host via --nv (R580+). Foundation for riceopticks-devel.def.
+    OptiX 9.0.0 headers + CUDA 13.0 toolkit on the Fermilab EL9 worker-node base.
+    Driver comes from the host via --nv (R580+). Foundation for riceopticks.def.
