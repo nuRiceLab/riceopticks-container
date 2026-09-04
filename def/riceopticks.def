@@ -33,8 +33,8 @@ From: optix-base.sif
 # Requires Apptainer >= 1.3. On older Apptainer/Singularity, delete this block
 # and replace every {{ NAME }} below with its literal default.
 %arguments
-    RICEOPTICKS_COMMIT=754d99225a60aa2370c1953064ee00375490eafc
-    RICEOPTICKS_VERSION=v1.0r
+    RICEOPTICKS_COMMIT=a7b1e6bdacc15eede646d2f0ae43ae62a89e7c7d
+    RICEOPTICKS_VERSION=v1.0r_09_04_2026
     COMPUTE_CAPABILITY=75
 
 %post -c /bin/bash
@@ -269,3 +269,11 @@ DEVEOF
                      -DGeant4_DIR=$Geant4_DIR -DROOT_DIR=$ROOT_DIR -DBCM_DIR=$BCM_DIR \
                      -DCUDAToolkit_ROOT=/usr/local/cuda -DOptiX_INSTALL_DIR=$OptiX_INSTALL_DIR
         Apptainer> cmake --build build -j$(nproc)
+
+# Assert the U4 API that laropticks requires is present. Without this the
+# mismatch only surfaces later as a compile error in OpticksInterface.cc.
+    grep -q "CollectGenstep_DsG4Scintillation_r4695_LArSoftv2" \
+        "$OPTICKS_PREFIX/include/U4/U4.hh" \
+        || { echo "FATAL: U4 lacks the LArSoftv2 API required by laropticks"; exit 1; }
+
+
