@@ -93,7 +93,7 @@ problem.
 
 The built image is published to the GitHub Container Registry as an ORAS
 artifact.
-
+Check image available at https://github.com/orgs/nuRiceLab/packages/container/package/riceopticks
 ```bash
 # Large image — point the cache somewhere with room. HPC home dirs usually
 # do not have it.
