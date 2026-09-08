@@ -1,0 +1,139 @@
+Bootstrap: docker
+From: fermilab/fnal-dev-sl7:latest
+
+# =============================================================================
+# OptiX + CUDA base image  (SL7 / UPS / mrb variant)
+#
+# SL7 counterpart of optix-base.def. Same idea, different constraints:
+#
+#   * Base: Fermilab fnal-dev-sl7 (Scientific Linux 7, glibc 2.17) -- the
+#     userspace the UPS larsoft/larsim/geant4 products on CVMFS were built
+#     against, and the only place mrb still works as documented.
+#
+#     Pulled from Docker Hub, NOT from the unpacked tree at
+#     /cvmfs/singularity.opensciencegrid.org/fermilab/fnal-dev-sl7:latest.
+#     The CVMFS tree is a mirror of this same Docker image, but it preserves
+#     the original file modes, so it contains root-owned mode-0000 files
+#     (/etc/shadow, /etc/gshadow, /etc/securetty, /etc/audit/...) that an
+#     unprivileged user simply cannot read. Bootstrapping from it as a
+#     localimage makes Apptainer's tar packer stall on the first such file
+#     and then emit "missed writing N bytes" for every file after it.
+#     Pulling layer tarballs over HTTPS sidesteps host permissions entirely
+#     and yields a byte-identical userspace.
+#
+#   * CUDA 12.4 toolkit, NOT 13.  This is not a preference, it is a hard
+#     ceiling: NVIDIA stopped producing RHEL7/CentOS7 packages after CUDA
+#     12.4.0, and the 12.5+ / 13.x binaries are linked against glibc 2.28,
+#     which SL7 does not have. nvcc from CUDA 13 will not run in this image.
+#     laropticks/README.md says "CUDA 13 Update 2 (tested)" -- that statement
+#     applies to the EL9 stack, not to this one.
+#
+#   * NVIDIA OptiX 9.0.0 headers from NVIDIA/optix-dev, exactly as in the EL9
+#     image. OptiX 7+ is header-only on the host side, so the OS version is
+#     irrelevant here -- the implementation ships in the display driver.
+#
+# The GPU DRIVER is NOT included -- it comes from the host at run time via
+# --nv. Host requirement to RUN anything built on this: NVIDIA R580+ driver
+# (OptiX 9 ABI), Turing (sm_75) or newer GPU.
+#
+# Nothing UPS-related happens in this layer. The compiler used to build
+# RiceOpticks is the UPS gcc that comes with the larsoft qualifier, and that
+# is set up in riceopticks-sl7.def. The SL7 system gcc (4.8.5) is never used
+# for anything except yum's own business.
+#
+# BUILD REQUIREMENTS: network access to
+#   * developer.download.nvidia.com  (CUDA toolkit)
+#   * github.com                     (OptiX headers)
+# =============================================================================
+
+%arguments
+    CUDA_SERIES=12-4
+    CUDA_HOME_DIR=cuda-12.4
+    OPTIX_TAG=v9.0.0
+    OPTIX_COMMIT=fff65c2a7c592f1ea5f1661ad7d2381cf965f9bd
+    COMPUTE_CAPABILITY=75
+
+%post -c /bin/bash
+    set -eux
+
+    mkdir -p /cvmfs                     # runtime bind mountpoint for downstream images
+
+    # ----- minimal system deps -------------------------------------------------
+    # Kept small on purpose. Everything Opticks actually links against comes
+    # from UPS in the next layer; these are just what yum/curl/git need plus
+    # the X11/GL headers the Opticks externals (glfw, glew, gleq, imgui) want.
+    yum -y install \
+        curl ca-certificates git make which findutils \
+        expat-devel zlib-devel openssl-devel libuuid-devel \
+        libX11-devel libXrandr-devel libXinerama-devel libXcursor-devel \
+        libXi-devel libXxf86vm-devel mesa-libGL-devel mesa-libGLU-devel
+    yum clean all
+
+    # ----- CUDA 12.4 toolkit from NVIDIA's rhel7 repo --------------------------
+    # Fetch the repo file directly rather than going through yum-config-manager,
+    # so this does not depend on yum-utils being present in the base image.
+    curl -fsSL -o /etc/yum.repos.d/cuda-rhel7.repo \
+        https://developer.download.nvidia.com/compute/cuda/repos/rhel7/x86_64/cuda-rhel7.repo
+
+    yum -y install cuda-toolkit-{{ CUDA_SERIES }}
+    yum clean all
+
+    # cuda-toolkit-12-4 installs to /usr/local/cuda-12.4 and normally creates a
+    # /usr/local/cuda symlink. Make sure it exists.
+    [ -e /usr/local/cuda ] || ln -s /usr/local/{{ CUDA_HOME_DIR }} /usr/local/cuda
+    /usr/local/cuda/bin/nvcc --version | grep -q "release 12.4" \
+        || { echo "FATAL: CUDA is not 12.4"; exit 1; }
+
+    # Hard gate on the thing that actually breaks on SL7: nvcc must be able to
+    # RUN, i.e. it must not need a glibc newer than 2.17. If someone bumps
+    # CUDA_SERIES past 12-4 this is where it will fail, loudly and early.
+    /usr/local/cuda/bin/nvcc --version > /dev/null \
+        || { echo "FATAL: nvcc will not execute on this glibc -- CUDA >12.4 is not usable on SL7"; exit 1; }
+
+    # ----- OptiX 9.0.0 headers (NVIDIA public header-only repo) ---------------
+    # NOTE: no --depth and no `git -C` here. SL7 ships git 1.8.3.1: `git -C`
+    # arrived in 1.8.5, so every repo operation has to be a subshell cd.
+    # A full clone of a ~1 MB repo is also cheaper than debugging
+    # shallow-clone-of-a-tag on an ancient git.
+    mkdir -p /opt/optix
+    git clone --branch {{ OPTIX_TAG }} \
+        https://github.com/NVIDIA/optix-dev /opt/optix/NVIDIA-OptiX-SDK-9.0.0
+    ( cd /opt/optix/NVIDIA-OptiX-SDK-9.0.0 && git rev-parse HEAD ) \
+        | grep -q '{{ OPTIX_COMMIT }}' \
+        || { echo "FATAL: optix-dev HEAD is not the pinned commit"; exit 1; }
+    rm -rf /opt/optix/NVIDIA-OptiX-SDK-9.0.0/.git
+    ln -sfn /opt/optix/NVIDIA-OptiX-SDK-9.0.0 /opt/optix/current
+
+    grep -q "define OPTIX_VERSION 90000" /opt/optix/current/include/optix.h \
+        || { echo "FATAL: OptiX headers are not 9.0.0"; exit 1; }
+
+    # NOTE: unlike the EL9 base, no compile smoke test here. The system gcc is
+    # 4.8.5 and is not the compiler anything will actually be built with. The
+    # real header + nvcc + gcc-13 compile gate lives in riceopticks-sl7.def,
+    # after the UPS toolchain is set up.
+
+    echo "OptiX 9.0.0 headers installed; CUDA 12.4 toolkit installed and executable."
+
+%environment
+    export PATH=/usr/local/cuda/bin:${PATH}
+    export CUDA_HOME=/usr/local/cuda
+    export CUDAToolkit_ROOT=/usr/local/cuda
+    export OptiX_INSTALL_DIR=/opt/optix/current
+    export OPTICKS_OPTIX_PREFIX=/opt/optix/current
+    export OPTICKS_CUDA_PREFIX=/usr/local/cuda
+    export OPTICKS_COMPUTE_CAPABILITY={{ COMPUTE_CAPABILITY }}
+
+%labels
+    Base fnal-dev-sl7
+    OS ScientificLinux7_glibc2.17
+    CUDA 12.4_toolkit_baked
+    CUDA_Ceiling_Reason rhel7_packages_end_at_12.4_glibc2.17
+    OptiX 9.0.0
+    OptiX_Source NVIDIA/optix-dev@{{ OPTIX_TAG }}
+    Driver_Floor R580
+    GPU_Arch_Floor Turing_sm{{ COMPUTE_CAPABILITY }}
+
+%help
+    OptiX 9.0.0 headers + CUDA 12.4 toolkit on the Fermilab SL7 dev base.
+    Driver comes from the host via --nv (R580+). Foundation for
+    riceopticks-sl7.def, which adds the UPS toolchain and builds RiceOpticks.

@@ -1,0 +1,464 @@
+Bootstrap: localimage
+From: optix-base-sl7.sif
+
+# =============================================================================
+# RiceOpticks + laropticks development image  (SL7 / UPS / mrb)
+#
+# What this image is for
+# ----------------------
+#   * RUN Opticks / lar executables          -> source /opt/setup.sh
+#   * BUILD laropticks with mrb              -> source /opt/laropticks-dev-env.sh
+#
+# laropticks is deliberately NOT baked in. It is an mrb package: users clone it
+# into srcs/ of their own writable dev area and `mrb i` it, exactly as
+# laropticks/README.md describes. What the image supplies is the one thing that
+# is painful to get right by hand -- a RiceOpticks installation compiled with
+# the *same* UPS compiler and against the *same* UPS Geant4/CLHEP/Xerces-C that
+# larsim and larg4 were built with, so that Opticks::G4CX and Opticks::U4 link
+# cleanly into an art plugin.
+#
+# Why the toolchain has to come from UPS
+# -------------------------------------
+# laropticks/laropticks/CMakeLists.txt links PDFullSimOpticks against
+# Opticks::G4CX and Opticks::U4 alongside larsim, art and ROOT targets. If
+# Opticks is built with a different gcc or a different Geant4 than larsoft,
+# you get either link errors or, worse, silent ABI corruption at run time. So
+# the build below sets up `larsoft <ver> -q e26:prof` and uses whatever
+# compiler and physics libraries that drags in. Nothing is hand-typed.
+#
+# How laropticks finds Opticks
+# ----------------------------
+# laropticks/CMakeLists.txt does:
+#     list(APPEND CMAKE_MODULE_PATH "$ENV{OPTICKS_HOME}/cmake/Modules")
+#     list(APPEND CMAKE_PREFIX_PATH "$ENV{OPTICKS_PREFIX}")
+#     set(OPTICKS_PREFIX "$ENV{OPTICKS_PREFIX}")
+#     find_dependency(PLog)
+#     find_package(G4CX REQUIRED CONFIG)
+#     find_package(U4 REQUIRED CONFIG)
+# So OPTICKS_HOME must point at the RiceOpticks *source* tree (for the Find*
+# modules) and OPTICKS_PREFIX at the *install* tree (for the exported configs
+# and for ${OPTICKS_PREFIX}/externals/plog/include). Both are set by
+# /opt/setup.sh. This is also why /opt/opticks is kept in the image rather
+# than deleted after the build.
+#
+# Build-time deps:  /cvmfs mounted  ->  apptainer build --bind /cvmfs ...
+# Runtime deps:     /cvmfs mounted AND an R580+ driver via --nv
+#
+# This image is NOT self-contained: Geant4/CLHEP/Xerces-C/ROOT and the UPS gcc
+# libstdc++ that Opticks is compiled against all load from CVMFS at run time.
+# It is pinned to one larsoft release.
+#
+# BEFORE BUILDING: run scripts/probe-sl7.sh and confirm that LARSOFT_VERSION
+# below actually exists for flavour Linux64bit+3.10-2.17. SL7 builds were
+# retired for the newer LArSoft releases; if the release you need is AlmaLinux
+# 9 only, this image cannot be built and you want the EL9 def files instead.
+# =============================================================================
+
+%arguments
+    RICEOPTICKS_REPO=https://github.com/nuRiceLab/RiceOpticks
+    RICEOPTICKS_COMMIT=a7b1e6bdacc15eede646d2f0ae43ae62a89e7c7d
+    RICEOPTICKS_VERSION=v1.0r_09_04_2026
+    LARSOFT_VERSION=v10_20_00
+    LARSOFT_QUAL=e26:prof
+    CMAKE_VERSION=v3_27_4
+    COMPUTE_CAPABILITY=75
+    UPS_SETUP=/cvmfs/larsoft.opensciencegrid.org/products/setup
+
+%post -c /bin/bash
+    set -eux
+
+    mkdir -p /cvmfs                            # runtime bind mountpoint
+
+    # ----- Phase 0: tools the Opticks externals shell out to -------------------
+    # unzip belongs in optix-base-sl7.def and is installed there. Repeated here
+    # so a base sif built before that was added still works -- rebuilding layer
+    # 1 means re-downloading the whole CUDA toolkit, which is not worth it for
+    # one package. No-op when the base already has it.
+    command -v unzip > /dev/null || yum -y install unzip
+
+    # ----- Phase 1: clone RiceOpticks at a PINNED COMMIT -----------------------
+    # The directory MUST be named 'opticks': the repo ships an __init__.py and
+    # `import opticks` needs a dir literally called 'opticks' on PYTHONPATH.
+    # Subshell cd rather than `git -C` -- SL7's git 1.8.3.1 predates that flag.
+    git clone {{ RICEOPTICKS_REPO }} /opt/opticks
+    ( cd /opt/opticks && git checkout {{ RICEOPTICKS_COMMIT }} )
+    ( cd /opt/opticks && git rev-parse HEAD ) | grep -q '{{ RICEOPTICKS_COMMIT }}' \
+        || { echo "FATAL: RiceOpticks is not at the pinned commit"; exit 1; }
+
+    # Assert the U4 API that laropticks/source/OpticksInterface.cc calls.
+    # Without this the mismatch only surfaces much later, as a compile error
+    # inside somebody else's mrb build.
+    for sym in CollectGenstep_DsG4Scintillation_r4695_LArSoft \
+               CollectGenstep_DsG4Scintillation_r4695_LArSoftv2 ; do
+        grep -q "$sym" /opt/opticks/u4/U4.hh \
+            || { echo "FATAL: U4.hh lacks $sym required by laropticks"; exit 1; }
+    done
+
+    # ----- Phase 2: UPS toolchain ---------------------------------------------
+    # Relax errexit/nounset around the UPS scripts: they touch unset vars and
+    # can return non-zero benignly. The explicit gates below catch real failures.
+    test -f {{ UPS_SETUP }} \
+        || { echo "FATAL: {{ UPS_SETUP }} missing -- build with --bind /cvmfs"; exit 1; }
+
+    set +eu
+    source {{ UPS_SETUP }}
+    setup larsoft {{ LARSOFT_VERSION }} -q {{ LARSOFT_QUAL }}
+    larsoft_rc=$?
+    setup cmake {{ CMAKE_VERSION }}
+    cmake_rc=$?
+    set -eu
+
+    test "$larsoft_rc" -eq 0 \
+        || { echo "FATAL: setup larsoft {{ LARSOFT_VERSION }} -q {{ LARSOFT_QUAL }} failed."; \
+             echo "       Run scripts/probe-sl7.sh -- this release probably has no SL7 flavour."; exit 1; }
+    test "$cmake_rc" -eq 0 || { echo "FATAL: setup cmake {{ CMAKE_VERSION }} failed"; exit 1; }
+
+    # ----- Phase 3: gate the toolchain before touching the build --------------
+    test -n "${GEANT4_FQ_DIR:-}"   || { echo "FATAL: GEANT4_FQ_DIR unset after setup larsoft"; exit 1; }
+    export CLHEP_PREFIX="${CLHEP_FQ_DIR:-${CLHEP_DIR:-}}"
+    export XERCES_PREFIX="${XERCES_C_FQ_DIR:-${XERCESCROOT:-}}"
+    test -n "$CLHEP_PREFIX"  || { echo "FATAL: cannot locate UPS CLHEP";     exit 1; }
+    test -n "$XERCES_PREFIX" || { echo "FATAL: cannot locate UPS xerces_c";  exit 1; }
+
+    # The compiler must be the UPS one, not SL7's gcc 4.8.5. Opticks and
+    # LArSoft both need C++17.
+    export CC=$(which gcc)
+    export CXX=$(which g++)
+    case "$CXX" in
+        /usr/bin/*) echo "FATAL: \$CXX is the SL7 system gcc ($CXX) -- UPS compiler not on PATH"; exit 1 ;;
+    esac
+    $CXX -std=c++17 -E -x c++ /dev/null > /dev/null \
+        || { echo "FATAL: $CXX does not accept -std=c++17"; exit 1; }
+
+    # Container CUDA must win over anything UPS puts on PATH.
+    export PATH=/usr/local/cuda/bin:$PATH
+    export CUDA_HOME=/usr/local/cuda
+    export CUDACXX=/usr/local/cuda/bin/nvcc
+    export CUDAHOSTCXX=$CXX
+    export CUDAToolkit_ROOT=/usr/local/cuda
+    nvcc --version | grep -q "release 12.4" || { echo "FATAL: nvcc is not CUDA 12.4"; exit 1; }
+
+    # Real compile gates: OptiX headers under the UPS compiler, and the
+    # nvcc-12.4 / UPS-gcc pairing. CUDA 12.4 refuses host compilers newer than
+    # gcc 13.2, so a future qualifier bump (e28 -> gcc 14) fails right here
+    # instead of 40 minutes into the Opticks build.
+    printf '#include <optix.h>\n#include <optix_stubs.h>\nint main(){return 0;}\n' > /tmp/t.c
+    $CC -I/opt/optix/current/include -I/usr/local/cuda/include -c /tmp/t.c -o /tmp/t.o
+    printf '__global__ void k(){}\nint main(){return 0;}\n' > /tmp/t.cu
+    nvcc -ccbin "$CXX" -arch=sm_{{ COMPUTE_CAPABILITY }} -c /tmp/t.cu -o /tmp/t.cu.o
+    rm -f /tmp/t.c /tmp/t.o /tmp/t.cu /tmp/t.cu.o
+    echo "toolchain gates passed: $($CXX --version | head -1) + $(nvcc --version | grep -o 'release [0-9.]*')"
+
+    # opticks-check-tools wants cmake, git, make, python (not python3) on PATH.
+    for tool in cmake git make python ; do
+        which $tool > /dev/null || { echo "FATAL: $tool not on PATH"; exit 1; }
+    done
+    case "$(cmake --version | head -1)" in
+        *"version 4"*) echo "FATAL: cmake 4.x removed FindCUDA, which Opticks still uses. Pin a 3.x UPS cmake."; exit 1 ;;
+    esac
+
+    # ----- Phase 4: Opticks build environment ---------------------------------
+    export OPTICKS_HOME=/opt/opticks
+    export OPTICKS_PREFIX=/usr/local/opticks
+    export OPTICKS_CUDA_PREFIX=/usr/local/cuda
+    export OPTICKS_OPTIX_PREFIX=/opt/optix/current
+    export OPTICKS_COMPUTE_CAPABILITY={{ COMPUTE_CAPABILITY }}
+    export OPTICKS_GEANT4_PREFIX=$GEANT4_FQ_DIR
+    export PYTHONPATH=/opt
+
+    # opticks-check-geant4 searches CMAKE_PREFIX_PATH for Geant4Config.cmake
+    # and then insists that $prefix/bin/geant4.sh exists next to it.
+    export CMAKE_PREFIX_PATH=/usr/local/cuda:$GEANT4_FQ_DIR:$CLHEP_PREFIX:$XERCES_PREFIX
+    test -n "$(find $GEANT4_FQ_DIR -name Geant4Config.cmake 2>/dev/null | head -1)" \
+        || { echo "FATAL: no Geant4Config.cmake under $GEANT4_FQ_DIR"; exit 1; }
+    test -f "$GEANT4_FQ_DIR/bin/geant4.sh" \
+        || { echo "FATAL: $GEANT4_FQ_DIR/bin/geant4.sh missing -- opticks-check-geant4 will reject this Geant4"; exit 1; }
+
+    export XERCESC_INCLUDE_DIR=$XERCES_PREFIX/include
+    export XERCESC_LIBRARY=$(ls $XERCES_PREFIX/lib/libxerces-c*.so 2>/dev/null | head -1)
+
+    mkdir -p $OPTICKS_PREFIX
+
+    # ----- Phase 5: build (GPU-prep auto-skips; no GPU needed at build time) --
+    set +eu   # Opticks scripts reference unset vars (VERBOSE, ...)
+    source /opt/opticks/opticks.bash
+    opticks-env
+    opticks-info
+    opticks-full
+    rc=$?
+    set -eu
+
+    test "$rc" -eq 0 || { echo "FATAL: opticks-full returned $rc"; exit 1; }
+    test -f $OPTICKS_PREFIX/lib64/libCSGOptiX.so \
+        || { echo "FATAL: libCSGOptiX.so not built"; exit 1; }
+    test -f $OPTICKS_PREFIX/lib64/libU4.so \
+        || { echo "FATAL: libU4.so not built"; exit 1; }
+    test -d $OPTICKS_PREFIX/externals/plog/include \
+        || { echo "FATAL: plog external missing -- laropticks find_dependency(PLog) will fail"; exit 1; }
+    echo "Opticks build verified."
+
+    # /opt/optix is intentionally NOT stripped: CSGOptiX bakes the absolute
+    # OptiX include path into its installed target, and FindOpticksOptiX.cmake
+    # re-resolves it from $OPTICKS_OPTIX_PREFIX/include with NO_DEFAULT_PATH,
+    # so any downstream find_package(G4CX) fails at CONFIGURE time without it.
+
+    # ----- build manifest: what Opticks was ACTUALLY compiled against ---------
+    # Recorded so the runtime env can warn when a user sets up a stack whose
+    # Geant4 differs from the one linked at build time. That mismatch does not
+    # necessarily fail to link -- it can corrupt silently at run time -- so it
+    # is worth an explicit check.
+    cat > /opt/opticks-build-manifest.sh <<EOM
+# generated at image build time -- DO NOT EDIT
+export OPTICKS_BUILD_LARSOFT="{{ LARSOFT_VERSION }}"
+export OPTICKS_BUILD_QUAL="{{ LARSOFT_QUAL }}"
+export OPTICKS_BUILD_GEANT4_FQ_DIR="$GEANT4_FQ_DIR"
+export OPTICKS_BUILD_CLHEP="$CLHEP_PREFIX"
+export OPTICKS_BUILD_XERCES="$XERCES_PREFIX"
+export OPTICKS_BUILD_CXX="$CXX"
+export OPTICKS_BUILD_GCC_VERSION="$($CXX -dumpversion)"
+export OPTICKS_BUILD_CUDA="$(nvcc --version | grep -o 'release [0-9.]*')"
+EOM
+    chmod +x /opt/opticks-build-manifest.sh
+
+    # ----- runtime "source and go" env ---------------------------------------
+    cat > /opt/setup.sh <<'EOS'
+#!/bin/bash
+# RiceOpticks RUNTIME environment (SL7 / UPS).
+#
+# This script deliberately sets up NO LArSoft/DUNE product. It bootstraps UPS
+# and puts CUDA, OptiX and Opticks in place; you choose the stack yourself:
+#
+#     source /cvmfs/dune.opensciencegrid.org/products/dune/setup_dune.sh
+#     setup dunesw v10_21_02d00 -q e26:prof
+#   or
+#     setup larsoft <version> -q e26:prof
+#
+# See /opt/opticks-build-manifest.sh for the exact Geant4 / CLHEP / gcc that
+# RiceOpticks in this image was compiled against -- your stack should match.
+#
+# Needs /cvmfs mounted and an R580+ driver via --nv.
+
+# Idempotent: this gets sourced by %runscript and again by
+# /opt/laropticks-dev-env.sh, and without a guard each pass re-prepends to
+# PATH. `unset OPTICKS_SETUP_DONE` to force a re-run.
+if [ -n "${OPTICKS_SETUP_DONE:-}" ]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+[ -z "${UPS_DIR:-}" ] && source {{ UPS_SETUP }}
+[ -f /opt/opticks-build-manifest.sh ] && source /opt/opticks-build-manifest.sh
+
+# mrb and cetmodules need cmake, and UPS does not put one on PATH until
+# mrbsetenv runs. Opticks uses the module-mode FindCUDA that cmake 4 removed,
+# so this deliberately picks the newest 3.x and never a 4.x.
+opticks-ups-cmake(){
+    local v
+    v=$(ups list -aK+ cmake 2>/dev/null | tr -d '"' | awk '{print $2}' \
+        | grep -E '^v3_' | sort -V | tail -1)
+    if [ -n "$v" ]; then
+        setup cmake "$v" && echo "=== opticks-ups-cmake : setup cmake $v"
+    else
+        echo "=== opticks-ups-cmake : no UPS cmake 3.x found" >&2
+        return 1
+    fi
+}
+
+# container CUDA 12.4 must win over anything UPS puts on PATH
+export PATH=/usr/local/cuda/bin:$PATH
+export CUDA_HOME=/usr/local/cuda
+export CUDAToolkit_ROOT=/usr/local/cuda
+
+export OPTICKS_HOME=/opt/opticks
+export OPTICKS_PREFIX=/usr/local/opticks
+export OPTICKS_CUDA_PREFIX=/usr/local/cuda
+: "${OPTICKS_OPTIX_PREFIX:=/opt/optix/current}"
+export OPTICKS_OPTIX_PREFIX
+export OptiX_INSTALL_DIR="$OPTICKS_OPTIX_PREFIX"
+export OPTICKS_COMPUTE_CAPABILITY={{ COMPUTE_CAPABILITY }}
+export PYTHONPATH=/opt${PYTHONPATH:+:$PYTHONPATH}
+
+# Opticks-generated runtime setup (executable + library paths)
+[ -f $OPTICKS_PREFIX/bin/opticks-setup.sh ] && source $OPTICKS_PREFIX/bin/opticks-setup.sh
+
+export LD_LIBRARY_PATH=$OPTICKS_PREFIX/lib64:$OPTICKS_PREFIX/externals/lib64:$OPTICKS_PREFIX/externals/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+
+# opticks-info, opticks-config, om-* and friends are bash FUNCTIONS defined in
+# opticks.bash, not executables -- without this they are simply not found.
+# The file is pure function definitions, so sourcing it has no side effects on
+# the environment set above.
+[ -f $OPTICKS_HOME/opticks.bash ] && source $OPTICKS_HOME/opticks.bash
+
+# Opticks installs its test/utility executables (OKConfTest, U4SimulateTest,
+# CSGOptiXSMTest, ...) into $OPTICKS_PREFIX/lib, not bin.
+export PATH=$OPTICKS_PREFIX/lib:$OPTICKS_PREFIX/bin:$PATH
+
+export OPTICKS_SETUP_DONE=1
+EOS
+    chmod +x /opt/setup.sh
+
+    # ----- mrb development env ------------------------------------------------
+    cat > /opt/laropticks-dev-env.sh <<'DEVEOF'
+#!/bin/bash
+# laropticks BUILD environment (SL7 / UPS / mrb).
+#
+# Source this AFTER you have set up your own stack -- it adds mrb and cmake on
+# top and checks that what you set up matches what Opticks was built against.
+#
+# Typical session:
+#
+#   apptainer run --nv -B /cvmfs -B $HOME/dunesw/laropticks:/work riceopticks-sl7.sif
+#   source /cvmfs/dune.opensciencegrid.org/products/dune/setup_dune.sh
+#   setup dunesw v10_21_02d00 -q e26:prof
+#   source /opt/laropticks-dev-env.sh
+#   cd /work                      # a WRITABLE bind-mounted directory
+#   mrb newDev -v $MRB_PROJECT_VERSION -q e26:prof
+#   source localProducts_*/setup
+#   cd $MRB_SOURCE && git clone https://github.com/nuRiceLab/laropticks
+#   cd $MRB_BUILDDIR && mrbsetenv && mrb i -j$(nproc)
+#
+# OPTICKS_HOME / OPTICKS_PREFIX survive mrbsetenv, which is what laropticks
+# CMakeLists.txt reads. Do not unset them.
+
+source /opt/setup.sh
+
+if [ -z "${GEANT4_FQ_DIR:-}" ]; then
+    echo "ERROR: no LArSoft/DUNE stack is set up yet." >&2
+    echo "       Set one up FIRST, then re-source this script, e.g.:" >&2
+    echo "         source /cvmfs/dune.opensciencegrid.org/products/dune/setup_dune.sh" >&2
+    echo "         setup dunesw <version> -q e26:prof" >&2
+    echo "       or: setup larsoft $OPTICKS_BUILD_LARSOFT -q $OPTICKS_BUILD_QUAL" >&2
+    return 1 2>/dev/null || exit 1
+fi
+
+setup mrb
+command -v cmake > /dev/null || opticks-ups-cmake
+
+# mrb needs to know which project the dev area is for; derive it from whatever
+# is actually set up rather than hardcoding one.
+if [ -z "${MRB_PROJECT:-}" ]; then
+    if   [ -n "${DUNESW_VERSION:-}" ]; then
+        export MRB_PROJECT=dunesw  MRB_PROJECT_VERSION=$DUNESW_VERSION
+    elif [ -n "${LARSOFT_VERSION:-}" ]; then
+        export MRB_PROJECT=larsoft MRB_PROJECT_VERSION=$LARSOFT_VERSION
+    fi
+fi
+
+_lo_show(){ local p; p=$(command -v "$1" 2>/dev/null); echo "${p:-NOT SET UP}"; }
+
+echo "laropticks build environment:"
+echo "  stack          : ${MRB_PROJECT:-<unknown>} ${MRB_PROJECT_VERSION:-}"
+echo "  g++            : $(_lo_show g++)"
+echo "  cmake          : $(_lo_show cmake)"
+echo "  nvcc           : $(_lo_show nvcc)"
+echo "  mrb            : $(_lo_show mrb)"
+echo "  OPTICKS_HOME   : $OPTICKS_HOME"
+echo "  OPTICKS_PREFIX : $OPTICKS_PREFIX"
+echo "  OptiX          : $OPTICKS_OPTIX_PREFIX"
+
+# The check that actually matters: Opticks was compiled and linked against one
+# specific Geant4. Using a different one can link and then misbehave at run
+# time, which is far harder to diagnose than a build error.
+if [ "${GEANT4_FQ_DIR:-}" != "${OPTICKS_BUILD_GEANT4_FQ_DIR:-}" ]; then
+    echo
+    echo "  *** WARNING: Geant4 MISMATCH ***"
+    echo "      Opticks built against : ${OPTICKS_BUILD_GEANT4_FQ_DIR:-<unknown>}"
+    echo "      currently set up      : ${GEANT4_FQ_DIR}"
+    echo "      Expect ABI trouble. Either set up a stack whose geant4 matches,"
+    echo "      or rebuild the image against yours."
+fi
+if [ -n "${OPTICKS_BUILD_GCC_VERSION:-}" ] \
+   && [ "$(g++ -dumpversion 2>/dev/null)" != "$OPTICKS_BUILD_GCC_VERSION" ]; then
+    echo
+    echo "  *** WARNING: compiler MISMATCH ***"
+    echo "      Opticks built with : gcc $OPTICKS_BUILD_GCC_VERSION"
+    echo "      currently set up   : gcc $(g++ -dumpversion 2>/dev/null)"
+fi
+
+echo
+echo "  Work in a bind-mounted writable dir; /opt and /usr/local are read-only."
+DEVEOF
+    chmod +x /opt/laropticks-dev-env.sh
+
+%environment
+    # Kept minimal on purpose. /opt/setup.sh adds CUDA, OptiX and Opticks and
+    # bootstraps UPS, but sets up NO LArSoft/DUNE product -- the user picks the
+    # stack. %runscript sources it for you; `apptainer shell` does NOT run
+    # %runscript, so source /opt/setup.sh by hand there.
+    export OPTICKS_HOME=/opt/opticks
+    export OPTICKS_PREFIX=/usr/local/opticks
+    export OPTICKS_OPTIX_PREFIX=/opt/optix/current
+    export PYTHONPATH=/opt
+
+%runscript
+    # Apptainer executes this file with /bin/sh, which on SL7 is bash in POSIX
+    # mode. POSIX mode rejects function names containing hyphens, and the
+    # generated $OPTICKS_PREFIX/bin/opticks-setup.sh defines `opticks-setup-`
+    # (dumped there by `declare -f` in opticks-setup-funcs--). Sourcing
+    # /opt/setup.sh directly from here therefore dies with
+    #     opticks-setup.sh: line 68: `opticks-setup-': not a valid identifier
+    # So hand off to a real, non-POSIX bash before sourcing anything.
+    #
+    # --rcfile is used for the interactive case so that the bash FUNCTIONS from
+    # opticks.bash (opticks-info, om-, ...) survive into the shell the user
+    # lands in; a plain `source ...; exec bash` would export the variables but
+    # lose every function. Note this means ~/.bashrc is not read.
+    if [ $# -eq 0 ]; then
+        exec /bin/bash --rcfile /opt/setup.sh -i
+    else
+        exec /bin/bash -c 'source /opt/setup.sh; exec "$@"' bash "$@"
+    fi
+
+%labels
+    RiceOpticks_Version {{ RICEOPTICKS_VERSION }}
+    RiceOpticks_Commit {{ RICEOPTICKS_COMMIT }}
+    Built_Against_LArSoft {{ LARSOFT_VERSION }}
+    Built_Against_Qual {{ LARSOFT_QUAL }}
+    Base fnal-dev-sl7
+    Toolchain UPS_mrb
+    CUDA 12.4
+    OptiX 9.0.0_headers_only
+    Driver_Floor R580
+    GPU_Arch_Floor Turing_sm{{ COMPUTE_CAPABILITY }}
+
+%help
+    RiceOpticks built against OptiX 9.0.0 + CUDA 12.4 on the Fermilab SL7 dev
+    base, using the UPS larsoft {{ LARSOFT_VERSION }} -q {{ LARSOFT_QUAL }}
+    toolchain from CVMFS as the compiler/Geant4 reference. Intended for
+    building and running laropticks with mrb.
+
+    That larsoft version is the BUILD reference only -- nothing is set up for
+    you at run time. See /opt/opticks-build-manifest.sh for the exact Geant4,
+    CLHEP and gcc RiceOpticks here was compiled against; /opt/laropticks-dev-env.sh
+    warns if the stack you set up disagrees.
+
+    Requires at runtime:
+      * /cvmfs mounted (larsoft.opensciencegrid.org, fermilab.opensciencegrid.org)
+      * NVIDIA R580+ driver, Turing (sm_75) or newer GPU, exposed via --nv
+
+    RUN (environment set up for you by %runscript):
+      apptainer run --nv --bind /cvmfs riceopticks-sl7.sif OKConfTest
+      apptainer run --nv --bind /cvmfs riceopticks-sl7.sif bash
+
+    OKConfTest lives in $OPTICKS_PREFIX/lib, which /opt/setup.sh puts on PATH.
+    Note that opticks-info, om- and similar are bash FUNCTIONS from
+    opticks.bash, not executables -- /opt/setup.sh sources that file, so they
+    work in a shell, but they cannot be passed as an argument to exec.
+
+    shell/exec do NOT run %runscript:
+      apptainer shell --nv --bind /cvmfs riceopticks-sl7.sif
+        Apptainer> source /opt/setup.sh
+
+    No LArSoft/DUNE product is set up for you -- you choose the stack, then
+    source the dev env on top of it. /opt/opticks-build-manifest.sh records
+    what RiceOpticks here was compiled against, and the dev env warns on a
+    Geant4 or compiler mismatch.
+
+    BUILD laropticks with mrb (needs a writable bind mount):
+      apptainer run --nv --bind /cvmfs --bind $PWD:/work riceopticks-sl7.sif bash
+        Apptainer> source /cvmfs/dune.opensciencegrid.org/products/dune/setup_dune.sh
+        Apptainer> setup dunesw <version> -q e26:prof
+        Apptainer> source /opt/laropticks-dev-env.sh
+        Apptainer> cd /work && mrb newDev -v $MRB_PROJECT_VERSION -q e26:prof
+        Apptainer> source localProducts_*/setup
+        Apptainer> cd $MRB_SOURCE && git clone https://github.com/nuRiceLab/laropticks
+        Apptainer> cd $MRB_BUILDDIR && mrbsetenv && mrb i -j8
