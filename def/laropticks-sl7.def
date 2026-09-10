@@ -1,0 +1,224 @@
+Bootstrap: localimage
+From: riceopticks-sl7.sif
+
+# =============================================================================
+# laropticks RUNTIME image  (SL7 / UPS)
+#
+# Layer 3. Takes the riceopticks-sl7 image (CUDA 12.4 + OptiX 9 + RiceOpticks
+# built against the UPS toolchain) and bakes in a BUILT laropticks, so users
+# get a working `lar` with PDFullSimOpticks and no mrb, no git clone, no build.
+#
+#   apptainer run --nv -B /cvmfs laropticks-sl7.sif
+#   lar -n 1 -c standard_g4_opticks_dune10kt_1x2x6.fcl -s Genie.root -o opticks.root
+#
+# How it works
+# ------------
+# An mrb dev area is created at /opt/laropticks during the build, laropticks is
+# cloned at a pinned commit, built, and installed into
+# /opt/laropticks/localProducts_<proj>_<ver>_<qual>/. That directory is an
+# ordinary UPS products area, so at run time nothing more is needed than
+# prepending it to $PRODUCTS and `setup laropticks`. mrb is a BUILD-time tool
+# only and is not used at run time.
+#
+# Because ups/product_deps declares fcldir/gdmldir/fwdir, `setup laropticks`
+# also populates FHICL_FILE_PATH and FW_SEARCH_PATH, so the shipped fcl and
+# GDML are found by name with no extra configuration.
+#
+# The dev area (srcs/) is kept -- it is ~20 MB and being able to read the fcl
+# and GDML that produced a result is worth more than the space. The build tree
+# is deleted.
+#
+# STILL A DEVELOPMENT IMAGE?
+# --------------------------
+# Users who want to MODIFY laropticks should use riceopticks-sl7.sif (layer 2)
+# and their own writable mrb area, as before. This image is for running.
+#
+# Build:   apptainer build --fakeroot --bind /cvmfs laropticks-sl7.sif laropticks-sl7.def
+# Runtime: /cvmfs mounted, R580+ driver via --nv, GPU arch matching
+#          COMPUTE_CAPABILITY of the layer-2 image underneath.
+# =============================================================================
+
+%arguments
+    LAROPTICKS_REPO=https://github.com/nuRiceLab/laropticks
+    LAROPTICKS_BRANCH=SL7
+    LAROPTICKS_COMMIT=
+    LAROPTICKS_UPS_VERSION=v10_09_01
+    MRB_PROJECT_NAME=larsoft
+    MRB_PROJECT_VER=v10_20_00
+    QUAL=e26:prof
+    EXPERIMENT_SETUP=/cvmfs/dune.opensciencegrid.org/products/dune/setup_dune.sh
+    EXPERIMENT_PRODUCT=dunesw
+    EXPERIMENT_VERSION=v10_20_00d00
+    UPS_SETUP=/cvmfs/larsoft.opensciencegrid.org/products/setup
+
+%post -c /bin/bash
+    set -eux
+
+    MRB_TOP=/opt/laropticks
+    mkdir -p $MRB_TOP
+
+    # ----- Phase 1: the stack ------------------------------------------------
+    # The fcl shipped with laropticks includes DUNE fcl (LArG4_dune.fcl,
+    # services_dune.fcl, PDFastSim_dune.fcl), so the experiment product has to
+    # be set up as well as the mrb project. Set EXPERIMENT_PRODUCT to an empty
+    # string to build against bare larsoft instead.
+    set +eu
+    source /opt/setup.sh
+    if [ -n "{{ EXPERIMENT_PRODUCT }}" ]; then
+        source {{ EXPERIMENT_SETUP }}
+        setup {{ EXPERIMENT_PRODUCT }} {{ EXPERIMENT_VERSION }} -q {{ QUAL }}
+        exp_rc=$?
+    else
+        exp_rc=0
+    fi
+    setup {{ MRB_PROJECT_NAME }} {{ MRB_PROJECT_VER }} -q {{ QUAL }}
+    proj_rc=$?
+    setup mrb
+    mrb_rc=$?
+    command -v cmake > /dev/null || opticks-ups-cmake
+    set -eu
+
+    test "$exp_rc"  -eq 0 || { echo "FATAL: setup {{ EXPERIMENT_PRODUCT }} {{ EXPERIMENT_VERSION }} failed"; exit 1; }
+    test "$proj_rc" -eq 0 || { echo "FATAL: setup {{ MRB_PROJECT_NAME }} {{ MRB_PROJECT_VER }} failed"; exit 1; }
+    test "$mrb_rc"  -eq 0 || { echo "FATAL: setup mrb failed"; exit 1; }
+    command -v cmake > /dev/null || { echo "FATAL: no cmake on PATH"; exit 1; }
+    test -n "${OPTICKS_PREFIX:-}" || { echo "FATAL: OPTICKS_PREFIX unset -- /opt/setup.sh did not run"; exit 1; }
+
+    export MRB_PROJECT={{ MRB_PROJECT_NAME }}
+
+    # ----- Phase 2: dev area + sources ---------------------------------------
+    cd $MRB_TOP
+    mrb newDev -v {{ MRB_PROJECT_VER }} -q {{ QUAL }}
+
+    set +eu
+    source $MRB_TOP/localProducts_*/setup
+    set -eu
+    test -n "${MRB_SOURCE:-}"   || { echo "FATAL: MRB_SOURCE unset after localProducts setup"; exit 1; }
+    test -n "${MRB_BUILDDIR:-}" || { echo "FATAL: MRB_BUILDDIR unset after localProducts setup"; exit 1; }
+
+    cd $MRB_SOURCE
+    git clone --branch {{ LAROPTICKS_BRANCH }} {{ LAROPTICKS_REPO }} laropticks
+    if [ -n "{{ LAROPTICKS_COMMIT }}" ]; then
+        ( cd laropticks && git checkout {{ LAROPTICKS_COMMIT }} )
+        ( cd laropticks && git rev-parse HEAD ) | grep -q '{{ LAROPTICKS_COMMIT }}' \
+            || { echo "FATAL: laropticks is not at the pinned commit"; exit 1; }
+    fi
+    ( cd laropticks && git log -1 --oneline )
+
+    # Cloning into srcs/ does NOT register the package -- srcs/CMakeLists.txt
+    # lists them explicitly and mrb uc regenerates it. Without this the build
+    # links with no laropticks objects and fails on undefined references.
+    mrb uc
+    grep -q laropticks $MRB_SOURCE/CMakeLists.txt \
+        || { echo "FATAL: mrb uc did not register laropticks in srcs/CMakeLists.txt"; exit 1; }
+
+    # ----- Phase 3: build ----------------------------------------------------
+    # mrbsetenv is an ALIAS defined by `setup mrb`, and aliases are not expanded
+    # in a non-interactive shell, so source the underlying script directly.
+    cd $MRB_BUILDDIR
+    set +eu
+    if [ -f "$MRB_DIR/bin/mrbSetEnv" ]; then
+        source $MRB_DIR/bin/mrbSetEnv
+    else
+        shopt -s expand_aliases
+        mrbsetenv
+    fi
+    setenv_rc=$?
+    set -eu
+    test "$setenv_rc" -eq 0 || { echo "FATAL: mrbsetenv failed"; exit 1; }
+
+    mrb i -j$(nproc)
+
+    # ----- Phase 4: verify ---------------------------------------------------
+    LP=$(echo $MRB_TOP/localProducts_*)
+    MODLIB=$(find $LP/laropticks -name 'liblaropticks_PDFullSimOpticks_module.so' | head -1)
+    test -n "$MODLIB" \
+        || { echo "FATAL: PDFullSimOpticks module library not installed"; exit 1; }
+
+    # A module that links but has undefined symbols at dlopen time is worse than
+    # a build failure -- art only finds out at job configuration. Check now.
+    ldd -r "$MODLIB" 2>&1 | grep -E '^undefined symbol' \
+        && { echo "FATAL: $MODLIB has undefined symbols"; exit 1; }
+
+    test -n "$(find $LP/laropticks -name 'standard_g4_opticks_dune10kt_1x2x6.fcl' | head -1)" \
+        || echo "WARNING: shipped fcl not found under $LP/laropticks -- check fcldir in ups/product_deps"
+    echo "laropticks installed: $MODLIB"
+
+    # ----- Phase 5: shrink ---------------------------------------------------
+    # Build tree is disposable; srcs is kept so the fcl/GDML that produced a
+    # result can be read from inside the image.
+    rm -rf $MRB_BUILDDIR
+    du -sh $MRB_TOP || true
+
+    # ----- runtime env -------------------------------------------------------
+    cat > /opt/laropticks-run.sh <<'RUNEOF'
+#!/bin/bash
+# laropticks RUNTIME environment (SL7 / UPS). Sourced by %runscript.
+#
+# Order matters: experiment stack first, then localProducts, then Opticks last
+# so its PATH/LD_LIBRARY_PATH entries sit ahead of anything UPS prepends.
+
+if [ -n "{{ EXPERIMENT_PRODUCT }}" ]; then
+    source {{ EXPERIMENT_SETUP }}
+    setup {{ EXPERIMENT_PRODUCT }} {{ EXPERIMENT_VERSION }} -q {{ QUAL }}
+else
+    source {{ UPS_SETUP }}
+    setup {{ MRB_PROJECT_NAME }} {{ MRB_PROJECT_VER }} -q {{ QUAL }}
+fi
+
+# The baked local products area is an ordinary UPS products area. Its setup
+# script prepends it to $PRODUCTS; mrb itself is not needed at run time.
+source /opt/laropticks/localProducts_*/setup
+setup laropticks {{ LAROPTICKS_UPS_VERSION }} -q {{ QUAL }}
+
+source /opt/setup.sh
+
+echo "laropticks {{ LAROPTICKS_UPS_VERSION }} ready"
+echo "  stack   : {{ EXPERIMENT_PRODUCT }} {{ EXPERIMENT_VERSION }} -q {{ QUAL }}"
+echo "  sources : /opt/laropticks/srcs/laropticks  (read-only)"
+echo "  GPU     : set CUDA_VISIBLE_DEVICES yourself on MIG hosts (use the MIG UUID)"
+RUNEOF
+    chmod +x /opt/laropticks-run.sh
+
+%environment
+    export LAROPTICKS_TOP=/opt/laropticks
+
+%runscript
+    # /bin/sh is bash in POSIX mode on SL7 and chokes on the hyphenated function
+    # names in Opticks' generated setup, so hand off to a real bash first.
+    if [ $# -eq 0 ]; then
+        exec /bin/bash --rcfile /opt/laropticks-run.sh -i
+    else
+        exec /bin/bash -c 'source /opt/laropticks-run.sh > /dev/null; exec "$@"' bash "$@"
+    fi
+
+%labels
+    laropticks_Version {{ LAROPTICKS_UPS_VERSION }}
+    laropticks_Branch {{ LAROPTICKS_BRANCH }}
+    laropticks_Commit {{ LAROPTICKS_COMMIT }}
+    Stack {{ EXPERIMENT_PRODUCT }}_{{ EXPERIMENT_VERSION }}
+    MRB_Project {{ MRB_PROJECT_NAME }}_{{ MRB_PROJECT_VER }}
+    Qualifier {{ QUAL }}
+    Contains laropticks_prebuilt_no_mrb_needed
+
+%help
+    Ready-to-run laropticks: PDFullSimOpticks built and installed, no mrb,
+    no git clone, no build step.
+
+      apptainer run --nv -B /cvmfs laropticks-sl7.sif
+        Apptainer> lar -n 1 -c prodgenie_nu_dune10kt_1x2x6.fcl -o Genie.root
+        Apptainer> lar -n 1 -c standard_g4_opticks_dune10kt_1x2x6.fcl -s Genie.root -o opticks.root
+
+    Or non-interactively:
+      apptainer run --nv -B /cvmfs -B $PWD laropticks-sl7.sif \
+        lar -n 1 -c standard_g4_opticks_dune10kt_1x2x6.fcl -s Genie.root
+
+    Bind a writable directory and cd into it -- the image is read-only and lar
+    writes its output to the current directory.
+
+    On a MIG host, CUDA needs the instance UUID, which is host-specific and so
+    cannot be baked in:
+      export CUDA_VISIBLE_DEVICES=$(nvidia-smi -L | grep -o 'MIG-[0-9a-f-]*' | head -1)
+
+    To MODIFY laropticks, use riceopticks-sl7.sif (layer 2) with your own mrb
+    dev area instead. The sources here are read-only.
